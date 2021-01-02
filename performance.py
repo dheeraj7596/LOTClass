@@ -3,7 +3,7 @@ from sklearn.metrics import classification_report
 
 if __name__ == "__main__":
     p = sys.argv[1]
-    base_path = "./" + p + "/"
+    base_path = "./datasets/" + p + "/"
     f = open(base_path + "label_names.txt", "r")
     lines = f.readlines()
     f.close()
