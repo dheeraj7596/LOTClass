@@ -1,5 +1,8 @@
 # LOTClass
 
+CUDA_VISIBLE_DEVICES=3 python3 src/train.py --train_batch_size=32 --accum_steps=4 --gpus=1 --eval_batch_size=32 --mcp_epochs=3 --self_train_epochs=1 --dataset_dir=datasets/politics --test_file=test.txt --test_label_file=test_labels.txt 
+
+
 The source code used for [**Text Classification Using Label Names Only: A Language Model Self-Training Approach**](https://arxiv.org/abs/2010.07245), published in EMNLP 2020.
 
 ## Requirements
