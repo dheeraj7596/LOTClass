@@ -555,7 +555,7 @@ class LOTClassTrainer(object):
         model = model.to(rank)
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
         model.train()
-        y_pseudo = data_dict["all_target_pred"]
+        y_pseudo = data_dict["all_target_pred"].numpy()
         dataset = TensorDataset(data_dict["input_ids"], data_dict["attention_masks"], data_dict["labels"])
         sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=rank)
         train_dataloader = DataLoader(dataset, sampler=sampler, batch_size=self.train_batch_size, shuffle=False)
