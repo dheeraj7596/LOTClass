@@ -666,6 +666,7 @@ class LOTClassTrainer(object):
         ret_labels = []
         for lbl in train_inds_map:
             for loop_ind in train_inds_map[lbl]:
+                print("Shape of data dict input ids to be added", data_dict["input_ids"][loop_ind].shape)
                 ret_input_ids.append(data_dict["input_ids"][loop_ind])
                 ret_masks.append(data_dict["attention_masks"][loop_ind])
                 ret_labels.append(data_dict["labels"][loop_ind])
