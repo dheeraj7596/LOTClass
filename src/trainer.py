@@ -19,6 +19,7 @@ import sys
 from tqdm import tqdm
 from model import LOTClassModel
 import warnings
+from collections import Counter
 
 warnings.filterwarnings("ignore")
 
@@ -58,7 +59,7 @@ class LOTClassTrainer(object):
         self.st_loss = nn.KLDivLoss(reduction='batchmean')
         self.update_interval = args.update_interval
         self.early_stop = args.early_stop
-        self.lops_enabled = int(args.lops)
+        self.lops_enabled = int(args.lops_enabled)
 
     # set up distributed training
     def set_up_dist(self, rank):
@@ -496,7 +497,8 @@ class LOTClassTrainer(object):
         target_dist = (weight.t() / torch.sum(weight, dim=1)).t()
         all_target_pred = target_dist.argmax(dim=-1)
         agree = (all_preds.argmax(dim=-1) == all_target_pred).int().sum().item() / len(all_target_pred)
-        self_train_dict = {"input_ids": input_ids, "attention_masks": input_mask, "labels": target_dist}
+        self_train_dict = {"input_ids": input_ids, "attention_masks": input_mask, "labels": target_dist,
+                           "all_target_pred": all_target_pred}
         return self_train_dict, idx, agree
 
     # train a model on batches of data with target labels
@@ -544,6 +546,144 @@ class LOTClassTrainer(object):
         except RuntimeError as err:
             self.cuda_mem_error(err, "train", rank)
 
+    def lops(self, rank, data_dict, optimizer, scheduler, percent_thresh=0.5):
+        print("LOPS running..")
+        model = LOTClassModel.from_pretrained(self.pretrained_lm,
+                                              output_attentions=False,
+                                              output_hidden_states=False,
+                                              num_labels=self.num_class)
+        model = model.to(rank)
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+        model.train()
+        y_pseudo = data_dict["all_target_pred"]
+        dataset = TensorDataset(data_dict["input_ids"], data_dict["attention_masks"], data_dict["labels"])
+        sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=rank)
+        train_dataloader = DataLoader(dataset, sampler=sampler, batch_size=self.train_batch_size, shuffle=False)
+
+        sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=rank, shuffle=False)
+        prediction_dataloader = DataLoader(dataset,
+                                           sampler=sampler,
+                                           batch_size=self.eval_batch_size,
+                                           shuffle=False
+                                           )
+
+        inds_map = {}
+        for i, j in enumerate(y_pseudo):
+            try:
+                inds_map[j].append(i)
+            except:
+                inds_map[j] = [i]
+
+        thresh_map = dict(Counter(y_pseudo))
+        print("Counts of pseudo-labels ", thresh_map, flush=True)
+        for i in thresh_map:
+            thresh_map[i] = int(thresh_map[i] * percent_thresh)
+
+        print("Threshold map ", thresh_map, flush=True)
+
+        filter_flag_map = {}
+        train_inds_map = {}
+        non_train_inds_map = {}
+        for i in thresh_map:
+            filter_flag_map[i] = False
+            train_inds_map[i] = []
+            non_train_inds_map[i] = []
+
+        total_train_loss = 0
+        wrap_train_dataset_loader = tqdm(train_dataloader) if rank == 0 else train_dataloader
+        model.zero_grad()
+        try:
+            for j, batch in enumerate(wrap_train_dataset_loader):
+                input_ids = batch[0].to(rank)
+                input_mask = batch[1].to(rank)
+                target_dist = batch[2].to(rank)
+                logits = model(input_ids,
+                               pred_mode="classification",
+                               token_type_ids=None,
+                               attention_mask=input_mask)
+                logits = logits[:, 0, :]
+                preds = nn.LogSoftmax(dim=-1)(logits)
+                loss = self.st_loss(preds.view(-1, self.num_class),
+                                    target_dist.view(-1, self.num_class)) / self.accum_steps
+                total_train_loss += loss.item()
+                loss.backward()
+                if (j + 1) % self.accum_steps == 0:
+                    # Clip the norm of the gradients to 1.0.
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    model.zero_grad()
+
+            avg_train_loss = torch.tensor([total_train_loss / len(wrap_train_dataset_loader) * self.accum_steps]).to(
+                rank)
+            gather_list = [torch.ones_like(avg_train_loss) for _ in range(self.world_size)]
+            dist.all_gather(gather_list, avg_train_loss)
+            avg_train_loss = torch.tensor(gather_list)
+            if rank == 0:
+                print(f"lr: {optimizer.param_groups[0]['lr']:.4g}")
+                print(f"Average training loss: {avg_train_loss.mean().item()}")
+        except RuntimeError as err:
+            self.cuda_mem_error(err, "train", rank)
+
+        input_ids, input_mask, preds = self.inference(model, prediction_dataloader, rank, return_type="data")
+        gather_input_ids = [torch.ones_like(input_ids) for _ in range(self.world_size)]
+        gather_input_mask = [torch.ones_like(input_mask) for _ in range(self.world_size)]
+        gather_preds = [torch.ones_like(preds) for _ in range(self.world_size)]
+        dist.all_gather(gather_input_ids, input_ids)
+        dist.all_gather(gather_input_mask, input_mask)
+        dist.all_gather(gather_preds, preds)
+        all_preds = torch.cat(gather_preds, dim=0).cpu()
+        pred_inds = all_preds.argmax(dim=-1)
+
+        count = 0
+        for i in filter_flag_map:
+            if not filter_flag_map[i]:
+                train_inds, non_train_inds = self.compute_train_non_train_inds(pred_inds, y_pseudo, inds_map, i)
+                train_inds_map[i] = train_inds
+                non_train_inds_map[i] = non_train_inds
+                if len(train_inds) >= thresh_map[i]:
+                    filter_flag_map[i] = True
+                    count += 1
+            else:
+                count += 1
+
+        print("Number of labels reached 50 percent threshold", count)
+        for i in filter_flag_map:
+            if not filter_flag_map[i]:
+                print("For label ", i, " Number expected ", thresh_map[i], " Found ", len(train_inds_map[i]))
+
+        for i in filter_flag_map:
+            if not filter_flag_map[i]:
+                print("Resetting train, non-train inds for label ", i)
+                train_inds_map[i] = inds_map[i]
+                non_train_inds_map[i] = []
+
+        ret_input_ids = []
+        ret_masks = []
+        ret_labels = []
+        for lbl in train_inds_map:
+            for loop_ind in train_inds_map[lbl]:
+                ret_input_ids.append(data_dict["input_ids"][loop_ind])
+                ret_masks.append(data_dict["attention_masks"][loop_ind])
+                ret_labels.append(data_dict["labels"][loop_ind])
+
+        all_input_ids = torch.cat(ret_input_ids, dim=0)
+        all_input_mask = torch.cat(ret_masks, dim=0)
+        all_labels = torch.cat(ret_labels, dim=0)
+
+        self_train_dict = {"input_ids": all_input_ids, "attention_masks": all_input_mask, "labels": all_labels}
+        return self_train_dict
+
+    def compute_train_non_train_inds(self, pred_inds, true_inds, inds_map, lbl):
+        train_inds = []
+        non_train_inds = []
+        for ind in inds_map[lbl]:
+            if pred_inds[ind] == true_inds[ind]:
+                train_inds.append(ind)
+            else:
+                non_train_inds.append(ind)
+        return train_inds, non_train_inds
+
     # self training (distributed function)
     def self_train_dist(self, rank, epochs, loader_name="final_model.pt"):
         model = self.set_up_dist(rank)
@@ -568,6 +708,9 @@ class LOTClassTrainer(object):
                 if agree_count >= 3:
                     break
             self_train_dataset_loader = self.make_dataloader(rank, self_train_dict, self.train_batch_size)
+            if self.lops_enabled:
+                new_train_dict = self.lops(rank, self_train_dict, optimizer, scheduler)
+                self_train_dataset_loader = self.make_dataloader(rank, new_train_dict, self.train_batch_size)
             self.self_train_batches(rank, model, self_train_dataset_loader, optimizer, scheduler, test_dataset_loader)
         if rank == 0:
             loader_file = os.path.join(self.dataset_dir, loader_name)

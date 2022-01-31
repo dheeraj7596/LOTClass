@@ -1,4 +1,3 @@
-
 from trainer import LOTClassTrainer
 import argparse
 
@@ -6,7 +5,7 @@ import argparse
 def main():
     parser = argparse.ArgumentParser(description='main',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    
+
     parser.add_argument('--dataset_dir', default='datasets/agnews/',
                         help='dataset directory')
     parser.add_argument('--label_names_file', default='label_names.txt',
@@ -47,6 +46,8 @@ def main():
                         help='number of gpus to use')
     parser.add_argument('--dist_port', type=int, default=12345,
                         help='distributed training port id; any number between 10000 and 20000 will work')
+    parser.add_argument('--lops_enabled', type=int, default=0,
+                        help='LOPS enabled/disabled')
 
     args = parser.parse_args()
     print(args)
@@ -64,4 +65,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
