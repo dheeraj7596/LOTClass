@@ -548,6 +548,9 @@ class LOTClassTrainer(object):
 
     def lops(self, rank, data_dict, optimizer, scheduler, percent_thresh=0.5):
         print("LOPS running..")
+        print("Before LOPS: Input Ids", data_dict["input_ids"].shape)
+        print("Before LOPS: Mask", data_dict["attention_masks"].shape)
+        print("Before LOPS: Labels", data_dict["labels"].shape)
         model = LOTClassModel.from_pretrained(self.pretrained_lm,
                                               output_attentions=False,
                                               output_hidden_states=False,
@@ -670,6 +673,9 @@ class LOTClassTrainer(object):
         all_input_ids = torch.cat(ret_input_ids, dim=0)
         all_input_mask = torch.cat(ret_masks, dim=0)
         all_labels = torch.cat(ret_labels, dim=0)
+        print("After LOPS: Input Ids", all_input_ids.shape)
+        print("After LOPS: Mask", all_input_mask.shape)
+        print("After LOPS: Labels", all_labels.shape)
 
         self_train_dict = {"input_ids": all_input_ids, "attention_masks": all_input_mask, "labels": all_labels}
         return self_train_dict
