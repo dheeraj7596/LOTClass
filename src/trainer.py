@@ -19,6 +19,7 @@ import sys
 from tqdm import tqdm
 from model import LOTClassModel
 import warnings
+
 warnings.filterwarnings("ignore")
 
 
@@ -35,14 +36,15 @@ class LOTClassTrainer(object):
         self.eval_batch_size = args.eval_batch_size
         self.accum_steps = args.accum_steps
         eff_batch_size = self.train_batch_size * self.world_size * self.accum_steps
-        assert abs(eff_batch_size - 128) < 10, f"Make sure the effective training batch size is around 128, current: {eff_batch_size}"
+        assert abs(
+            eff_batch_size - 128) < 10, f"Make sure the effective training batch size is around 128, current: {eff_batch_size}"
         print(f"Effective training batch size: {eff_batch_size}")
         self.pretrained_lm = 'bert-base-uncased'
         self.tokenizer = BertTokenizer.from_pretrained(self.pretrained_lm, do_lower_case=True)
         self.vocab = self.tokenizer.get_vocab()
         self.vocab_size = len(self.vocab)
         self.mask_id = self.vocab[self.tokenizer.mask_token]
-        self.inv_vocab = {k:v for v, k in self.vocab.items()}
+        self.inv_vocab = {k: v for v, k in self.vocab.items()}
         self.read_label_names(args.dataset_dir, args.label_names_file)
         self.num_class = len(self.label_name_dict)
         self.model = LOTClassModel.from_pretrained(self.pretrained_lm,
@@ -56,6 +58,7 @@ class LOTClassTrainer(object):
         self.st_loss = nn.KLDivLoss(reduction='batchmean')
         self.update_interval = args.update_interval
         self.early_stop = args.early_stop
+        self.lops_enabled = int(args.lops)
 
     # set up distributed training
     def set_up_dist(self, rank):
@@ -82,8 +85,10 @@ class LOTClassTrainer(object):
 
     # convert a list of strings to token ids
     def encode(self, docs):
-        encoded_dict = self.tokenizer.batch_encode_plus(docs, add_special_tokens=True, max_length=self.max_len, padding='max_length',
-                                                        return_attention_mask=True, truncation=True, return_tensors='pt')
+        encoded_dict = self.tokenizer.batch_encode_plus(docs, add_special_tokens=True, max_length=self.max_len,
+                                                        padding='max_length',
+                                                        return_attention_mask=True, truncation=True,
+                                                        return_tensors='pt')
         input_ids = encoded_dict['input_ids']
         attention_masks = encoded_dict['attention_mask']
         return input_ids, attention_masks
@@ -94,7 +99,8 @@ class LOTClassTrainer(object):
         return strings
 
     # convert dataset into tensors
-    def create_dataset(self, dataset_dir, text_file, label_file, loader_name, find_label_name=False, label_name_loader_name=None):
+    def create_dataset(self, dataset_dir, text_file, label_file, loader_name, find_label_name=False,
+                       label_name_loader_name=None):
         loader_file = os.path.join(dataset_dir, loader_name)
         if os.path.exists(loader_file):
             print(f"Loading encoded texts from {loader_file}")
@@ -105,7 +111,7 @@ class LOTClassTrainer(object):
             docs = [doc.strip() for doc in corpus.readlines()]
             print(f"Converting texts into tensors.")
             chunk_size = ceil(len(docs) / self.num_cpus)
-            chunks = [docs[x:x+chunk_size] for x in range(0, len(docs), chunk_size)]
+            chunks = [docs[x:x + chunk_size] for x in range(0, len(docs), chunk_size)]
             results = Parallel(n_jobs=self.num_cpus)(delayed(self.encode)(docs=chunk) for chunk in chunks)
             input_ids = torch.cat([result[0] for result in results])
             attention_masks = torch.cat([result[1] for result in results])
@@ -130,32 +136,34 @@ class LOTClassTrainer(object):
                 docs = [doc.strip() for doc in corpus.readlines()]
                 print("Locating label names in the corpus.")
                 chunk_size = ceil(len(docs) / self.num_cpus)
-                chunks = [docs[x:x+chunk_size] for x in range(0, len(docs), chunk_size)]
-                results = Parallel(n_jobs=self.num_cpus)(delayed(self.label_name_occurrence)(docs=chunk) for chunk in chunks)
+                chunks = [docs[x:x + chunk_size] for x in range(0, len(docs), chunk_size)]
+                results = Parallel(n_jobs=self.num_cpus)(
+                    delayed(self.label_name_occurrence)(docs=chunk) for chunk in chunks)
                 input_ids_with_label_name = torch.cat([result[0] for result in results])
                 attention_masks_with_label_name = torch.cat([result[1] for result in results])
                 label_name_idx = torch.cat([result[2] for result in results])
                 assert len(input_ids_with_label_name) > 0, "No label names appear in corpus!"
-                label_name_data = {"input_ids": input_ids_with_label_name, "attention_masks": attention_masks_with_label_name, "labels": label_name_idx}
+                label_name_data = {"input_ids": input_ids_with_label_name,
+                                   "attention_masks": attention_masks_with_label_name, "labels": label_name_idx}
                 loader_file = os.path.join(dataset_dir, label_name_loader_name)
                 print(f"Saving texts with label names into {loader_file}")
                 torch.save(label_name_data, loader_file)
             return data, label_name_data
         else:
             return data
-    
+
     # find label name indices and replace out-of-vocab label names with [MASK]
     def label_name_in_doc(self, doc):
         doc = self.tokenizer.tokenize(doc)
         label_idx = -1 * torch.ones(self.max_len, dtype=torch.long)
         new_doc = []
         wordpcs = []
-        idx = 1 # index starts at 1 due to [CLS] token
+        idx = 1  # index starts at 1 due to [CLS] token
         for i, wordpc in enumerate(doc):
             wordpcs.append(wordpc[2:] if wordpc.startswith("##") else wordpc)
-            if idx >= self.max_len - 1: # last index will be [SEP] token
+            if idx >= self.max_len - 1:  # last index will be [SEP] token
                 break
-            if i == len(doc) - 1 or not doc[i+1].startswith("##"):
+            if i == len(doc) - 1 or not doc[i + 1].startswith("##"):
                 word = ''.join(wordpcs)
                 if word in self.label2class:
                     label_idx[idx] = self.label2class[word]
@@ -182,8 +190,10 @@ class LOTClassTrainer(object):
                 text_with_label.append(result[0])
                 label_name_idx.append(result[1].unsqueeze(0))
         if len(text_with_label) > 0:
-            encoded_dict = self.tokenizer.batch_encode_plus(text_with_label, add_special_tokens=True, max_length=self.max_len, 
-                                                            padding='max_length', return_attention_mask=True, truncation=True, return_tensors='pt')
+            encoded_dict = self.tokenizer.batch_encode_plus(text_with_label, add_special_tokens=True,
+                                                            max_length=self.max_len,
+                                                            padding='max_length', return_attention_mask=True,
+                                                            truncation=True, return_tensors='pt')
             input_ids_with_label_name = encoded_dict['input_ids']
             attention_masks_with_label_name = encoded_dict['attention_mask']
             label_name_idx = torch.cat(label_name_idx, dim=0)
@@ -195,8 +205,9 @@ class LOTClassTrainer(object):
 
     # read text corpus and labels from files
     def read_data(self, dataset_dir, train_file, test_file, test_label_file):
-        self.train_data, self.label_name_data = self.create_dataset(dataset_dir, train_file, None, "train.pt", 
-                                                                    find_label_name=True, label_name_loader_name="label_name_data.pt")
+        self.train_data, self.label_name_data = self.create_dataset(dataset_dir, train_file, None, "train.pt",
+                                                                    find_label_name=True,
+                                                                    label_name_loader_name="label_name_data.pt")
         if test_file is not None:
             self.test_data = self.create_dataset(dataset_dir, test_file, test_label_file, "test.pt")
 
@@ -204,7 +215,8 @@ class LOTClassTrainer(object):
     def read_label_names(self, dataset_dir, label_name_file):
         label_name_file = open(os.path.join(dataset_dir, label_name_file))
         label_names = label_name_file.readlines()
-        self.label_name_dict = {i: [word.lower() for word in category_words.strip().split()] for i, category_words in enumerate(label_names)}
+        self.label_name_dict = {i: [word.lower() for word in category_words.strip().split()] for i, category_words in
+                                enumerate(label_names)}
         print(f"Label names used for each class are: {self.label_name_dict}")
         self.label2class = {}
         self.all_label_name_ids = [self.mask_id]
@@ -232,7 +244,8 @@ class LOTClassTrainer(object):
         all_words = defaultdict(list)
         sorted_dicts = {}
         for i, cat_dict in self.category_words_freq.items():
-            sorted_dict = {k:v for k, v in sorted(cat_dict.items(), key=lambda item: item[1], reverse=True)[:category_vocab_size]}
+            sorted_dict = {k: v for k, v in
+                           sorted(cat_dict.items(), key=lambda item: item[1], reverse=True)[:category_vocab_size]}
             sorted_dicts[i] = sorted_dict
             for word_id in sorted_dict:
                 all_words[word_id].append(i)
@@ -270,14 +283,14 @@ class LOTClassTrainer(object):
                     match_idx = label_pos >= 0
                     predictions = model(input_ids,
                                         pred_mode="mlm",
-                                        token_type_ids=None, 
+                                        token_type_ids=None,
                                         attention_mask=input_mask)
                     _, sorted_res = torch.topk(predictions[match_idx], top_pred_num, dim=-1)
                     label_idx = label_pos[match_idx]
                     for i, word_list in enumerate(sorted_res):
                         for j, word_id in enumerate(word_list):
                             category_words_freq[label_idx[i].item()][word_id.item()] += 1
-            save_file = os.path.join(self.temp_dir, f"{rank}_"+loader_name)
+            save_file = os.path.join(self.temp_dir, f"{rank}_" + loader_name)
             torch.save(category_words_freq, save_file)
         except RuntimeError as err:
             self.cuda_mem_error(err, "eval", rank)
@@ -353,7 +366,7 @@ class LOTClassTrainer(object):
                 "all_input_mask": all_input_mask,
                 "category_doc_num": category_doc_num,
             }
-            save_file = os.path.join(self.temp_dir, f"{rank}_"+loader_name)
+            save_file = os.path.join(self.temp_dir, f"{rank}_" + loader_name)
             torch.save(save_dict, save_file)
         except RuntimeError as err:
             self.cuda_mem_error(err, "eval", rank)
@@ -389,8 +402,9 @@ class LOTClassTrainer(object):
             if os.path.exists(self.temp_dir):
                 shutil.rmtree(self.temp_dir)
             for i in category_doc_num:
-                assert category_doc_num[i] > 10, f"Too few ({category_doc_num[i]}) documents with category indicative terms found for category {i}; " \
-                       "try to add more unlabeled documents to the training corpus (recommend) or reduce `--match_threshold` (not recommend)"
+                assert category_doc_num[
+                           i] > 10, f"Too few ({category_doc_num[i]}) documents with category indicative terms found for category {i}; " \
+                                    "try to add more unlabeled documents to the training corpus (recommend) or reduce `--match_threshold` (not recommend)"
         print(f"There are totally {len(self.mcp_data['input_ids'])} documents with category indicative terms.")
 
     # masked category prediction (distributed function)
@@ -399,13 +413,14 @@ class LOTClassTrainer(object):
         mcp_dataset_loader = self.make_dataloader(rank, self.mcp_data, self.train_batch_size)
         total_steps = len(mcp_dataset_loader) * epochs / self.accum_steps
         optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-5, eps=1e-8)
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1*total_steps, num_training_steps=total_steps)
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1 * total_steps,
+                                                    num_training_steps=total_steps)
         try:
             for i in range(epochs):
                 model.train()
                 total_train_loss = 0
                 if rank == 0:
-                    print(f"Epoch {i+1}:")
+                    print(f"Epoch {i + 1}:")
                 wrap_mcp_dataset_loader = tqdm(mcp_dataset_loader) if rank == 0 else mcp_dataset_loader
                 model.zero_grad()
                 for j, batch in enumerate(wrap_mcp_dataset_loader):
@@ -416,15 +431,15 @@ class LOTClassTrainer(object):
                     labels = labels[mask_pos]
                     # mask out category indicative words
                     input_ids[mask_pos] = self.mask_id
-                    logits = model(input_ids, 
+                    logits = model(input_ids,
                                    pred_mode="classification",
-                                   token_type_ids=None, 
+                                   token_type_ids=None,
                                    attention_mask=input_mask)
                     logits = logits[mask_pos]
                     loss = self.mcp_loss(logits.view(-1, self.num_class), labels.view(-1)) / self.accum_steps
                     total_train_loss += loss.item()
                     loss.backward()
-                    if (j+1) % self.accum_steps == 0:
+                    if (j + 1) % self.accum_steps == 0:
                         # Clip the norm of the gradients to 1.0.
                         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         optimizer.step()
@@ -455,7 +470,8 @@ class LOTClassTrainer(object):
 
     # prepare self training data and target distribution
     def prepare_self_train_data(self, rank, model, idx):
-        target_num = min(self.world_size * self.train_batch_size * self.update_interval * self.accum_steps, len(self.train_data["input_ids"]))
+        target_num = min(self.world_size * self.train_batch_size * self.update_interval * self.accum_steps,
+                         len(self.train_data["input_ids"]))
         if idx + target_num >= len(self.train_data["input_ids"]):
             select_idx = torch.cat((torch.arange(idx, len(self.train_data["input_ids"])),
                                     torch.arange(idx + target_num - len(self.train_data["input_ids"]))))
@@ -476,7 +492,7 @@ class LOTClassTrainer(object):
         input_ids = torch.cat(gather_input_ids, dim=0).cpu()
         input_mask = torch.cat(gather_input_mask, dim=0).cpu()
         all_preds = torch.cat(gather_preds, dim=0).cpu()
-        weight = all_preds**2 / torch.sum(all_preds, dim=0)
+        weight = all_preds ** 2 / torch.sum(all_preds, dim=0)
         target_dist = (weight.t() / torch.sum(weight, dim=1)).t()
         all_target_pred = target_dist.argmax(dim=-1)
         agree = (all_preds.argmax(dim=-1) == all_target_pred).int().sum().item() / len(all_target_pred)
@@ -500,10 +516,11 @@ class LOTClassTrainer(object):
                                attention_mask=input_mask)
                 logits = logits[:, 0, :]
                 preds = nn.LogSoftmax(dim=-1)(logits)
-                loss = self.st_loss(preds.view(-1, self.num_class), target_dist.view(-1, self.num_class)) / self.accum_steps
+                loss = self.st_loss(preds.view(-1, self.num_class),
+                                    target_dist.view(-1, self.num_class)) / self.accum_steps
                 total_train_loss += loss.item()
                 loss.backward()
-                if (j+1) % self.accum_steps == 0:
+                if (j + 1) % self.accum_steps == 0:
                     # Clip the norm of the gradients to 1.0.
                     nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
@@ -514,7 +531,8 @@ class LOTClassTrainer(object):
                 gather_acc = [torch.ones_like(acc) for _ in range(self.world_size)]
                 dist.all_gather(gather_acc, acc)
                 acc = torch.tensor(gather_acc).mean().item()
-            avg_train_loss = torch.tensor([total_train_loss / len(wrap_train_dataset_loader) * self.accum_steps]).to(rank)
+            avg_train_loss = torch.tensor([total_train_loss / len(wrap_train_dataset_loader) * self.accum_steps]).to(
+                rank)
             gather_list = [torch.ones_like(avg_train_loss) for _ in range(self.world_size)]
             dist.all_gather(gather_list, avg_train_loss)
             avg_train_loss = torch.tensor(gather_list)
@@ -529,10 +547,13 @@ class LOTClassTrainer(object):
     # self training (distributed function)
     def self_train_dist(self, rank, epochs, loader_name="final_model.pt"):
         model = self.set_up_dist(rank)
-        test_dataset_loader = self.make_dataloader(rank, self.test_data, self.eval_batch_size) if self.with_test_label else None
-        total_steps = int(len(self.train_data["input_ids"]) * epochs / (self.world_size * self.train_batch_size * self.accum_steps))
+        test_dataset_loader = self.make_dataloader(rank, self.test_data,
+                                                   self.eval_batch_size) if self.with_test_label else None
+        total_steps = int(
+            len(self.train_data["input_ids"]) * epochs / (self.world_size * self.train_batch_size * self.accum_steps))
         optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-6, eps=1e-8)
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1*total_steps, num_training_steps=total_steps)
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1 * total_steps,
+                                                    num_training_steps=total_steps)
         idx = 0
         if self.early_stop:
             agree_count = 0
@@ -564,7 +585,7 @@ class LOTClassTrainer(object):
                                "attention_masks": self.train_data["attention_masks"][rand_idx]}
             print(f"\nStart self-training.")
             mp.spawn(self.self_train_dist, nprocs=self.world_size, args=(epochs, loader_name))
-    
+
     # use a model to do inference on a dataloader
     def inference(self, model, dataset_loader, rank, return_type):
         if return_type == "data":
@@ -613,7 +634,7 @@ class LOTClassTrainer(object):
                 return pred_labels
         except RuntimeError as err:
             self.cuda_mem_error(err, "eval", rank)
-    
+
     # use trained model to make predictions on the test set
     def write_results(self, loader_name="final_model.pt", out_file="out.txt"):
         loader_file = os.path.join(self.dataset_dir, loader_name)
@@ -636,7 +657,9 @@ class LOTClassTrainer(object):
             print(err)
             if "CUDA out of memory" in str(err):
                 if mode == "eval":
-                    print(f"Your GPUs can't hold the current batch size for evaluation, try to reduce `--eval_batch_size`, current: {self.eval_batch_size}")
+                    print(
+                        f"Your GPUs can't hold the current batch size for evaluation, try to reduce `--eval_batch_size`, current: {self.eval_batch_size}")
                 else:
-                    print(f"Your GPUs can't hold the current batch size for training, try to reduce `--train_batch_size`, current: {self.train_batch_size}")
+                    print(
+                        f"Your GPUs can't hold the current batch size for training, try to reduce `--train_batch_size`, current: {self.train_batch_size}")
         sys.exit(1)
