@@ -1,5 +1,5 @@
 import sys
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, f1_score
 
 if __name__ == "__main__":
     p = sys.argv[1]
@@ -33,3 +33,6 @@ if __name__ == "__main__":
         true.append(index_to_label[int(true_lines[i].strip())])
 
     print(classification_report(true, preds))
+
+    print("Micro F1", f1_score(true, preds, average="micro"))
+    print("Macro F1", f1_score(true, preds, average="macro"))
